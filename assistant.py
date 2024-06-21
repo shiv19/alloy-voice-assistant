@@ -2,9 +2,8 @@ import base64
 from io import BytesIO
 import time
 import logging
-import re
 import os
-import time
+import threading
 
 import openai
 from PIL import ImageGrab
@@ -31,6 +30,14 @@ class Assistant:
         self.repeat_count = 0
         self.last_command_time = 0   # Track the time of the last command
 
+    @staticmethod
+    def acknowledge_prompt():
+        os.system('say "One moment please. Taking a screenshot and sharing it with the assistant."')
+
+    @staticmethod
+    def play_sound(path):
+        os.system(f'afplay "{path}"')
+
     def answer(self, prompt):
         if not prompt:
             return
@@ -55,13 +62,15 @@ class Assistant:
 
         logging.info(f"Received prompt: {prompt}")
 
-        # Play a beep sound to indicate that the assistant heard the command
-        os.system('afplay /System/Library/Sounds/Blow.aiff')
+        # Play a blow sound to indicate that the assistant API call is about to be made
+        play_blow_sound = threading.Thread(target=Assistant.play_sound, args=('/System/Library/Sounds/Blow.aiff',))
+        play_blow_sound.start()
 
         start_time = time.time()
 
         try:
-            os.system('say "One moment please. Taking a screenshot and sharing it with the assistant."')
+            # ack_thread = threading.Thread(target=Assistant.acknowledge_prompt)
+            # ack_thread.start()
             # Take a screenshot and convert to RGB
             screenshot = ImageGrab.grab()
             screenshot_rgb = screenshot.convert('RGB')
