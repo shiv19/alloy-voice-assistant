@@ -2,6 +2,9 @@ import base64
 from io import BytesIO
 import time
 import logging
+import re
+import os
+import time
 
 import openai
 from PIL import ImageGrab
@@ -26,10 +29,14 @@ class Assistant:
         self.chain = self._create_inference_chain(model)
         self.last_prompt = ""
         self.repeat_count = 0
+        self.last_command_time = 0   # Track the time of the last command
 
     def answer(self, prompt):
         if not prompt:
             return
+
+        current_time = time.time()
+        time_since_last_command = current_time - self.last_command_time
 
         # Check for repeated prompts
         if prompt == self.last_prompt:
@@ -41,9 +48,20 @@ class Assistant:
             self.last_prompt = prompt
             self.repeat_count = 0
 
+        if time_since_last_command < 2:  # Wait at least 2 seconds between processing commands
+            logging.info(f"Debounced prompt: {prompt}")
+            return
+        self.last_command_time = current_time
+
         logging.info(f"Received prompt: {prompt}")
 
+        # Play a beep sound to indicate that the assistant heard the command
+        os.system('afplay /System/Library/Sounds/Blow.aiff')
+
+        start_time = time.time()
+
         try:
+            os.system('say "One moment please. Taking a screenshot and sharing it with the assistant."')
             # Take a screenshot and convert to RGB
             screenshot = ImageGrab.grab()
             screenshot_rgb = screenshot.convert('RGB')
@@ -62,6 +80,9 @@ class Assistant:
             self.chat_history.add_ai_message(response)
 
             logging.info(f"Generated response: {response}")
+            end_time = time.time()  # End the timer
+            duration = end_time - start_time  # Calculate the duration
+            logging.info(f"Response time: {duration:.2f} seconds")
 
             if response:
                 self._tts(response)
@@ -70,16 +91,20 @@ class Assistant:
 
     def _tts(self, response):
         try:
-            player = PyAudio().open(format=paInt16, channels=1, rate=24000, output=True)
+            # Use the macOS 'say' command to generate text-to-speech
+            os.system(f'say "{response}"')
 
-            with openai.audio.speech.with_streaming_response.create(
-                model="tts-1",
-                voice="alloy",
-                response_format="pcm",
-                input=response,
-            ) as stream:
-                for chunk in stream.iter_bytes(chunk_size=1024):
-                    player.write(chunk)
+            # Use the OpenAI API to generate text-to-speech
+            # player = PyAudio().open(format=paInt16, channels=1, rate=24000, output=True)
+
+            # with openai.audio.speech.with_streaming_response.create(
+            #     model="tts-1",
+            #     voice="alloy",
+            #     response_format="pcm",
+            #     input=response,
+            # ) as stream:
+            #     for chunk in stream.iter_bytes(chunk_size=1024):
+            #         player.write(chunk)
         except Exception as e:
             logging.error(f"Error in text-to-speech: {str(e)}")
 
@@ -123,22 +148,59 @@ assistant = Assistant(model)
 
 def audio_callback(recognizer, audio):
     try:
-        prompt = recognizer.recognize_whisper(audio, model="base", language="english")
+        # Recognize speech using the Whisper API
+        response = recognizer.recognize_whisper(audio, model="base", language="english")
 
-        # Simple noise filtering
-        if len(prompt.split()) < 3:  # Ignore very short phrases
-            # logging.info(f"Ignored short phrase: {prompt}")
-            return
+        # Simple noise and filler word filtering, and validation
+        prompt = filter_speech(response)
 
-        logging.info(f"Recognized speech: {prompt}")
+        # Check if the prompt is non-trivial and remove repeated phrases
+        if is_valid_prompt(prompt):
+            clean_prompt = remove_repeated_phrases(prompt)
+            logging.info(f"Recognized speech: {clean_prompt}")
+            assistant.answer(clean_prompt)
+        else:
+            logging.info(f"Ignored invalid or short phrase: {response}")
 
-        assistant.answer(prompt)
     except UnknownValueError:
         logging.warning("Speech recognition could not understand audio")
     except RequestError as e:
         logging.error(f"Could not request results from speech recognition service; {str(e)}")
     except Exception as e:
         logging.error(f"Unexpected error in audio callback: {str(e)}")
+
+def filter_speech(response):
+    # A function to clean up and filter recognized speech text
+    filler_words = {'um', 'uh', 'like', 'you know', 'actually', 'basically', 'literally', 'so', 'well', 'okay'}
+    words = [word for word in response.lower().split() if word not in filler_words]
+    return ' '.join(words)
+
+def is_valid_prompt(prompt):
+    # A function to check if a prompt is valid
+    min_word_count = 3
+    return len(prompt.split()) >= min_word_count and not contains_repetition(prompt)
+
+def contains_repetition(text):
+    # Check for repeated phrases
+    words = text.split()
+    for i in range(len(words) - 1):
+        phrase = ' '.join(words[:i+1])
+        remainder = ' '.join(words[i+1:])
+        if remainder.startswith(phrase):
+            return True
+    return False
+
+def remove_repeated_phrases(text):
+    # Remove repeated phrases from text
+    words = text.split()
+    buffer = []
+    seen_phrases = set()
+    for i in range(len(words)):
+        phrase = ' '.join(words[:i+1])
+        if phrase not in seen_phrases:
+            seen_phrases.add(phrase)
+            buffer.append(words[i])
+    return ' '.join(buffer)
 
 recognizer = Recognizer()
 microphone = Microphone()
