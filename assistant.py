@@ -4,7 +4,9 @@ import time
 import logging
 import os
 import threading
+from collections import deque
 
+from groq import Groq
 import openai
 from PIL import ImageGrab
 from dotenv import load_dotenv
@@ -15,7 +17,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 from pyaudio import PyAudio, paInt16
-from speech_recognition import Microphone, Recognizer, UnknownValueError, RequestError
+from speech_recognition import Microphone, Recognizer, UnknownValueError, RequestError, AudioData
 
 load_dotenv()
 
@@ -26,94 +28,80 @@ class Assistant:
     def __init__(self, model):
         self.chat_history = ChatMessageHistory()
         self.chain = self._create_inference_chain(model)
-        self.last_prompt = ""
-        self.repeat_count = 0
-        self.last_command_time = 0   # Track the time of the last command
-
-    @staticmethod
-    def acknowledge_prompt():
-        os.system('say "One moment please. Taking a screenshot and sharing it with the assistant."')
+        self.command_buffer = deque(maxlen=5)  # Store last 5 commands
+        self.last_command_time = 0
+        self.debounce_time = 2  # Seconds to wait between commands
+        self.min_word_count = 3  # Minimum number of words for a valid command
 
     @staticmethod
     def play_sound(path):
         os.system(f'afplay "{path}"')
 
     def answer(self, prompt):
-        if not prompt:
+        if not self._is_valid_command(prompt):
             return
 
         current_time = time.time()
-        time_since_last_command = current_time - self.last_command_time
-
-        # Check for repeated prompts
-        if prompt == self.last_prompt:
-            self.repeat_count += 1
-            if self.repeat_count > 2:
-                logging.warning(f"Repeated prompt detected: {prompt}")
-                return
-        else:
-            self.last_prompt = prompt
-            self.repeat_count = 0
-
-        if time_since_last_command < 2:  # Wait at least 2 seconds between processing commands
+        if current_time - self.last_command_time < self.debounce_time:
             logging.info(f"Debounced prompt: {prompt}")
             return
+
         self.last_command_time = current_time
+        logging.info(f"Processing prompt: {prompt}")
 
-        logging.info(f"Received prompt: {prompt}")
-
-        # Play a blow sound to indicate that the assistant API call is about to be made
-        play_blow_sound = threading.Thread(target=Assistant.play_sound, args=('/System/Library/Sounds/Blow.aiff',))
-        play_blow_sound.start()
-
-        start_time = time.time()
+        # Play sound to indicate API call
+        threading.Thread(target=self.play_sound, args=('/System/Library/Sounds/Blow.aiff',)).start()
 
         try:
-            # ack_thread = threading.Thread(target=Assistant.acknowledge_prompt)
-            # ack_thread.start()
-            # Take a screenshot and convert to RGB
             screenshot = ImageGrab.grab()
             screenshot_rgb = screenshot.convert('RGB')
             buffered = BytesIO()
             screenshot_rgb.save(buffered, format="JPEG")
             img_str = base64.b64encode(buffered.getvalue()).decode()
 
+            start_time = time.time()
             response = self.chain.invoke({
                 "prompt": prompt,
                 "image_base64": img_str,
                 "chat_history": self.chat_history.messages
             })
+            end_time = time.time()
 
-            # Add the exchange to chat history
             self.chat_history.add_user_message(prompt)
             self.chat_history.add_ai_message(response)
 
             logging.info(f"Generated response: {response}")
-            end_time = time.time()  # End the timer
-            duration = end_time - start_time  # Calculate the duration
-            logging.info(f"Response time: {duration:.2f} seconds")
+            logging.info(f"Response time: {end_time - start_time:.2f} seconds")
 
             if response:
                 self._tts(response)
         except Exception as e:
             logging.error(f"Error in answer method: {str(e)}")
 
+    def _is_valid_command(self, prompt):
+        if not prompt or len(prompt.split()) < self.min_word_count:
+            return False
+
+        # Check for repetition
+        if prompt in self.command_buffer:
+            logging.warning(f"Repeated prompt detected: {prompt}")
+            return False
+
+        self.command_buffer.append(prompt)
+        return True
+
     def _tts(self, response):
         try:
-            # Use the macOS 'say' command to generate text-to-speech
-            os.system(f'say "{response}"')
+            player = PyAudio().open(format=paInt16, channels=1, rate=24000, output=True)
 
-            # Use the OpenAI API to generate text-to-speech
-            # player = PyAudio().open(format=paInt16, channels=1, rate=24000, output=True)
-
-            # with openai.audio.speech.with_streaming_response.create(
-            #     model="tts-1",
-            #     voice="alloy",
-            #     response_format="pcm",
-            #     input=response,
-            # ) as stream:
-            #     for chunk in stream.iter_bytes(chunk_size=1024):
-            #         player.write(chunk)
+            with openai.audio.speech.with_streaming_response.create(
+                model="tts-1",
+                voice="alloy",
+                response_format="pcm",
+                input=response,
+            ) as stream:
+                for chunk in stream.iter_bytes(chunk_size=1024):
+                    player.write(chunk)
         except Exception as e:
             logging.error(f"Error in text-to-speech: {str(e)}")
 
@@ -152,22 +140,45 @@ class Assistant:
             | StrOutputParser()
         )
 
-model = ChatOpenAI(model="gpt-4o")
-assistant = Assistant(model)
+def filter_speech(text):
+    filler_words = {'um', 'uh', 'like', 'you know', 'actually', 'basically', 'literally', 'so', 'well', 'okay'}
+    words = text.lower().split()
+    filtered_words = [word for word in words if word not in filler_words]
+    return ' '.join(filtered_words)
 
-def audio_callback(recognizer, audio):
+def remove_repeated_phrases(text):
+    words = text.split()
+    result = []
+    for i in range(len(words)):
+        if i == 0 or words[i] != words[i-1]:
+            result.append(words[i])
+    return ' '.join(result)
+
+def audio_callback(recognizer, audio, assistant):
     try:
-        # Recognize speech using the Whisper API
-        response = recognizer.recognize_whisper(audio, model="base", language="english")
+        audio: AudioData = audio
+        with open("audio-file.wav", "wb") as f:
+            f.write(audio.get_wav_data())
 
-        # Simple noise and filler word filtering, and validation
-        prompt = filter_speech(response)
+        client = Groq()
+        filename = os.path.dirname(__file__) + "/audio-file.wav"
 
-        # Check if the prompt is non-trivial and remove repeated phrases
-        if is_valid_prompt(prompt):
-            clean_prompt = remove_repeated_phrases(prompt)
-            logging.info(f"Recognized speech: {clean_prompt}")
-            assistant.answer(clean_prompt)
+        with open(filename, "rb") as file:
+            transcription = client.audio.transcriptions.create(
+                file=(filename, file.read()),
+                model="whisper-large-v3",
+                response_format="json",
+                language="en",
+                temperature=0.0
+            )
+
+        response = transcription.text
+        filtered_response = filter_speech(response)
+        clean_response = remove_repeated_phrases(filtered_response)
+
+        if clean_response:
+            logging.info(f"Recognized speech: {clean_response}")
+            assistant.answer(clean_response)
         else:
             logging.info(f"Ignored invalid or short phrase: {response}")
 
@@ -178,58 +189,38 @@ def audio_callback(recognizer, audio):
     except Exception as e:
         logging.error(f"Unexpected error in audio callback: {str(e)}")
 
-def filter_speech(response):
-    # A function to clean up and filter recognized speech text
-    filler_words = {'um', 'uh', 'like', 'you know', 'actually', 'basically', 'literally', 'so', 'well', 'okay'}
-    words = [word for word in response.lower().split() if word not in filler_words]
-    return ' '.join(words)
+def main():
+    model = ChatOpenAI(model="gpt-4o")
+    assistant = Assistant(model)
 
-def is_valid_prompt(prompt):
-    # A function to check if a prompt is valid
-    min_word_count = 3
-    return len(prompt.split()) >= min_word_count and not contains_repetition(prompt)
+    recognizer = Recognizer()
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+    microphone = Microphone()
 
-def contains_repetition(text):
-    # Check for repeated phrases
-    words = text.split()
-    for i in range(len(words) - 1):
-        phrase = ' '.join(words[:i+1])
-        remainder = ' '.join(words[i+1:])
-        if remainder.startswith(phrase):
-            return True
-    return False
+    print("Listening for voice commands. Press Ctrl+C to exit.")
+    logging.info("Starting voice command listener")
 
-def remove_repeated_phrases(text):
-    # Remove repeated phrases from text
-    words = text.split()
-    buffer = []
-    seen_phrases = set()
-    for i in range(len(words)):
-        phrase = ' '.join(words[:i+1])
-        if phrase not in seen_phrases:
-            seen_phrases.add(phrase)
-            buffer.append(words[i])
-    return ' '.join(buffer)
+    try:
+        with microphone as source:
+            recognizer.adjust_for_ambient_noise(source)
 
-recognizer = Recognizer()
-microphone = Microphone()
+        stop_listening = recognizer.listen_in_background(
+            microphone,
+            lambda recognizer, audio: audio_callback(recognizer, audio, assistant),
+            phrase_time_limit=30
+        )
 
-print("Listening for voice commands. Press Ctrl+C to exit.")
-logging.info("Starting voice command listener")
+        while True:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("Stopping...")
+    except Exception as e:
+        logging.error(f"Unexpected error in main loop: {str(e)}")
+    finally:
+        logging.info("Shutting down")
+        if 'stop_listening' in locals():
+            stop_listening(wait_for_stop=False)
 
-try:
-    with microphone as source:
-        recognizer.adjust_for_ambient_noise(source)
-
-    stop_listening = recognizer.listen_in_background(microphone, audio_callback, phrase_time_limit=15)
-
-    while True:
-        time.sleep(0.1)
-except KeyboardInterrupt:
-    print("Stopping...")
-except Exception as e:
-    logging.error(f"Unexpected error in main loop: {str(e)}")
-finally:
-    logging.info("Shutting down")
-    if 'stop_listening' in locals():
-        stop_listening(wait_for_stop=False)
+if __name__ == "__main__":
+    main()
